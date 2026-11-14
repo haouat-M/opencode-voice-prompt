@@ -1,8 +1,13 @@
 node_modules/
 __pycache__/
 *.pyc
+*.pyo
 .venv/
 venv/
+*.tgz
+package-lock.json
+.pytest_cache/
+*.egg-info/
 *.log
 .DS_Store
 Thumbs.db

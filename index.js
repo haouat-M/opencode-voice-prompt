@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Plugin } from "@opencode/plugin";
@@ -11,17 +12,27 @@ const ENGINE = path.join(HERE, "scripts", "engine.py");
 const JSON_START = "__JSON_START__";
 const JSON_END = "__JSON_END__";
 
-const TRANSCRIBE_OUTPUT = {
-  type: "object",
-  properties: {
-    text: { type: "string" },
-    raw: { type: "string" },
-    duration: { type: "number" },
-    language: { type: "string" },
-    error: { type: "string" },
-  },
-  required: ["text"],
-};
+/** Python packages the engine needs, in pip spelling. */
+const PIP_PACKAGES = ["SpeechRecognition", "sounddevice", "numpy"];
+
+/** A pip install can take a while on a cold machine. */
+const INSTALL_TIMEOUT_MS = 5 * 60 * 1000;
+
+/** A failed setup is retried quickly; the user may have just fixed the cause. */
+const RETRY_AFTER_MS = 30 * 1000;
+
+/** A successful check is reused for this long before revalidating. */
+const READY_TTL_MS = 5 * 60 * 1000;
+
+/** Extra time the watchdog allows after the engine's own recording timeout. */
+const WATCHDOG_GRACE_SECONDS = 25;
+
+const PEP668_RE = /externally-managed-environment|EXTERNALLY-MANAGED/i;
+const PIP_MISSING_RE = /No module named pip|pip is not installed|ensurepip is not available/i;
+const STORE_STUB_RE =
+  /Python was not found|Python est introuvable|Microsoft Store|App execution alias|لم يتم العثور على Python/i;
+const DEPENDENCY_FAILURE_RE =
+  /ModuleNotFoundError|No module named|ImportError|missing Python package|speech_recognition|sounddevice/i;
 
 const ENSURE_OUTPUT = {
   type: "object",
@@ -29,9 +40,23 @@ const ENSURE_OUTPUT = {
     ok: { type: "boolean" },
     installed: { type: "boolean" },
     missing: { type: "array" },
+    python: { type: "string" },
     error: { type: "string" },
   },
   required: ["ok"],
+};
+
+const TRANSCRIBE_OUTPUT = {
+  type: "object",
+  properties: {
+    text: { type: "string" },
+    raw: { type: "string" },
+    duration: { type: "number" },
+    language: { type: "string" },
+    code: { type: "string" },
+    error: { type: "string" },
+  },
+  required: ["text"],
 };
 
 /**
@@ -42,7 +67,13 @@ export const Voice = Rpc.define({
   id: "voice",
   methods: {
     ensure: {
-      input: { type: "object", properties: {} },
+      input: {
+        type: "object",
+        properties: {
+          // Every explicit click asks for a fresh check, even after a failure.
+          force: { type: "boolean" },
+        },
+      },
       output: ENSURE_OUTPUT,
     },
     transcribe: {
@@ -68,7 +99,10 @@ export const Voice = Rpc.define({
       input: { type: "object", properties: {} },
       output: {
         type: "object",
-        properties: { recording: { type: "boolean" } },
+        properties: {
+          recording: { type: "boolean" },
+          phase: { type: "string" },
+        },
         required: ["recording"],
       },
     },
@@ -89,6 +123,14 @@ function parseEngineOutput(stdout) {
   }
 }
 
+function lastLine(text) {
+  return String(text ?? "")
+    .trim()
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .pop();
+}
+
 function pythonCandidates(options) {
   const list = [];
 
@@ -101,25 +143,38 @@ function pythonCandidates(options) {
     list.push(process.env.OPENCODE_VOICE_PYTHON);
   }
   // 3. Whatever is first on PATH. macOS and most Linux distributions ship
-  //    "python3" without a "python" alias; Windows also exposes "py".
+  //    "python3" without a "python" alias; Windows also exposes "py" and, less
+  //    often, "python3" (Git Bash / MSYS).
   list.push("python");
-  if (process.platform === "win32") {
-    list.push("py");
-  } else {
-    list.push("python3");
-  }
+  if (process.platform === "win32") list.push("py");
+  list.push("python3");
 
   return [...new Set(list)];
 }
 
-/** Python packages the engine needs, in pip spelling. */
-const PIP_PACKAGES = ["SpeechRecognition", "sounddevice", "numpy"];
+function venvPython(directory) {
+  return process.platform === "win32"
+    ? path.join(directory, "Scripts", "python.exe")
+    : path.join(directory, "bin", "python");
+}
 
-/** A pip install can take a while on a cold machine. */
-const INSTALL_TIMEOUT_MS = 5 * 60 * 1000;
+function resolveVenvPath(options) {
+  const configured =
+    (typeof options.venvPath === "string" && options.venvPath.trim()) ||
+    process.env.OPENCODE_VOICE_VENV;
+  if (configured) return path.resolve(HERE, configured);
+  return path.join(homedir(), ".cache", "opencode-voice-prompt", "venv");
+}
 
-/** After a failed setup, wait this long before trying to install again. */
-const RETRY_AFTER_MS = 5 * 60 * 1000;
+function normalizePath(value) {
+  return String(value ?? "").replace(/[\\/]+$/, "").toLowerCase();
+}
+
+function sameExecutable(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  return normalizePath(a) === normalizePath(b);
+}
 
 /**
  * Run a process and collect its output. Never rejects: a missing interpreter is
@@ -130,6 +185,7 @@ function spawnCapture(exe, args, options = {}) {
     let stdout = "";
     let stderr = "";
     let done = false;
+    let timedOut = false;
     /** @type {NodeJS.Timeout | null} */
     let timer = null;
 
@@ -149,18 +205,27 @@ function spawnCapture(exe, args, options = {}) {
         env: { ...process.env, PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1" },
       });
     } catch (error) {
-      resolve({ enoent: true, code: -1, stdout, stderr: String(error?.message ?? error) });
+      resolve({
+        enoent: error?.code === "ENOENT",
+        code: -1,
+        stdout,
+        stderr: String(error?.message ?? error),
+      });
       return;
     }
 
     if (options.timeout) {
       timer = setTimeout(() => {
+        // A killed child closes with code === null. Remember why, otherwise a
+        // timeout would be reported as a successful exit code 0.
+        timedOut = true;
         try {
           child.kill();
         } catch {
           /* already gone */
         }
       }, options.timeout);
+      timer.unref?.();
     }
 
     child.stdout?.on("data", (chunk) => {
@@ -180,17 +245,15 @@ function spawnCapture(exe, args, options = {}) {
     });
 
     child.on("close", (code) => {
-      finish({ enoent: false, code: code ?? 0, stdout, stderr });
+      finish({
+        enoent: false,
+        code: timedOut ? -1 : code ?? 0,
+        timedOut,
+        stdout,
+        stderr,
+      });
     });
   });
-}
-
-function lastLine(text) {
-  return String(text ?? "")
-    .trim()
-    .split(/\r?\n/)
-    .filter(Boolean)
-    .pop();
 }
 
 export default Plugin.define({
@@ -200,46 +263,193 @@ export default Plugin.define({
     const options = ctx.options ?? {};
 
     const defaultLanguage = typeof options.language === "string" ? options.language : "ar-SA";
-    const defaultSilence = typeof options.silenceSeconds === "number" ? options.silenceSeconds : 2.2;
-    const defaultTimeout = typeof options.timeoutSeconds === "number" ? options.timeoutSeconds : 90;
+    const defaultSilence = numberOption(options.silenceSeconds, 1.5, 0.3, 10);
+    const defaultTimeout = numberOption(options.timeoutSeconds, 90, 5, 300);
+    const inputDevice =
+      typeof options.inputDevice === "string" || typeof options.inputDevice === "number"
+        ? String(options.inputDevice).trim()
+        : "";
+    const sampleRate = numberOption(options.sampleRate, 0, 0, 192000);
+    const autoFixTerms = options.autoFixTerms !== false;
+    const allowAgentRecording = options.allowAgentRecording === true;
+    const allowBreakSystemPackages = options.allowBreakSystemPackages === true;
+    const venvPath = resolveVenvPath(options);
     const execs = pythonCandidates(options);
+    const cachedVenvPython = venvPython(venvPath);
+    if (existsSync(cachedVenvPython)) execs.unshift(cachedVenvPython);
+
+    const customFixes = normalizeFixes(options.fixes);
 
     /** @type {import("node:child_process").ChildProcess | null} */
     let active = null;
 
+    /** "recording" or "processing" while a dictation runs; empty when idle. */
+    let activePhase = "";
+
+    /** Interpreter that passed the doctor probe, reused for recording. */
+    let resolvedExe = null;
+
     /** Cached result of the last dependency check. */
-    let deps = { ready: false, checked: false, error: "", missing: /** @type {string[]} */ ([]), at: 0 };
+    let deps = {
+      ready: false,
+      checked: false,
+      error: "",
+      missing: /** @type {string[]} */ ([]),
+      at: 0,
+    };
 
     /** Shared in-flight check so two clicks never run pip at the same time. */
     let ensureInFlight = null;
 
-    const installDeps = async (exe, missing) => {
-      const packages = missing.length ? missing : PIP_PACKAGES;
-      const base = ["-m", "pip", "install", "--disable-pip-version-check", "--no-input"];
+    const doctorArgs = () => {
+      const args = [ENGINE, "--action", "doctor"];
+      if (inputDevice) args.push("--device", inputDevice);
+      return args;
+    };
 
-      // A virtual environment refuses --user, so fall back to a plain install.
-      for (const args of [
-        [...base, "--user", ...packages],
-        [...base, ...packages],
-      ]) {
-        const result = await spawnCapture(exe, args, { timeout: INSTALL_TIMEOUT_MS });
-        if (result.code === 0) return { ok: true };
-        const tail = lastLine(result.stderr);
-        if (args.includes("--user")) continue;
-        return { ok: false, error: tail || `pip exited with code ${result.code}` };
+    const pipInstall = (exe, packages, extra = [], timeout = INSTALL_TIMEOUT_MS) => {
+      return spawnCapture(
+        exe,
+        ["-m", "pip", "install", "--disable-pip-version-check", "--no-input", ...extra, ...packages],
+        { timeout },
+      );
+    };
+
+    const describePipFailure = (result, exe) => {
+      const stderr = String(result?.stderr ?? "");
+      const output = `${result?.stdout ?? ""}\n${stderr}`;
+      if (PEP668_RE.test(output)) return pep668Message(exe);
+      if (STORE_STUB_RE.test(output)) return storeStubMessage(exe);
+      if (PIP_MISSING_RE.test(output)) {
+        return (
+          `pip is not available for ${exe}. Run "${exe} -m ensurepip --upgrade", ` +
+          `or install pip for that interpreter, then try again.`
+        );
+      }
+      if (result?.timedOut) return `pip timed out after ${INSTALL_TIMEOUT_MS / 1000} seconds`;
+      return lastLine(stderr) || lastLine(result?.stdout) || `pip exited with code ${result?.code ?? -1}`;
+    };
+
+    const installInVenv = async (exe, packages) => {
+      const python = venvPython(venvPath);
+
+      if (!existsSync(python)) {
+        try {
+          mkdirSync(path.dirname(venvPath), { recursive: true });
+        } catch {
+          /* the venv tool reports the real error below */
+        }
+        const create = await spawnCapture(exe, ["-m", "venv", venvPath], { timeout: 2 * 60 * 1000 });
+        if (create.code !== 0) {
+          // On Debian/Ubuntu the venv failure is printed to stdout, not stderr.
+          const output = `${create.stdout ?? ""}\n${create.stderr ?? ""}`;
+          const summary =
+            output
+              .split(/\r?\n/)
+              .map((line) => line.trim())
+              .find((line) => /not created successfully|No module named venv|ensurepip/i.test(line)) ||
+            lastLine(output) ||
+            `exit code ${create.code}`;
+          const hint = /ensurepip|python3-venv|venv module|No module named venv|not created successfully/i.test(
+            output,
+          )
+            ? ` Install the venv support for ${exe} first ("sudo apt install python3-venv" on Debian/Ubuntu provides ensurepip), or set the "python" option to a working interpreter.`
+            : ` Install the venv support for ${exe}, or set the "python" option to a working interpreter.`;
+          return {
+            ok: false,
+            error: `could not create a private Python environment at ${venvPath}: ${summary}.${hint}`,
+          };
+        }
       }
 
-      return { ok: false, error: "pip could not install the voice libraries" };
+      const result = await pipInstall(python, packages);
+      if (result.code === 0) return { ok: true, python };
+      const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+      if (PIP_MISSING_RE.test(output)) {
+        return {
+          ok: false,
+          error:
+            `the private environment at ${venvPath} exists but has no pip. ` +
+            `Delete that folder, install python3-venv ("sudo apt install python3-venv") so it can be recreated, then try again.`,
+        };
+      }
+      return { ok: false, error: describePipFailure(result, python) };
+    };
+
+    const installDeps = async (exe, missing) => {
+      const packages = missing.length ? missing : PIP_PACKAGES;
+      let last = null;
+      let needsVenv = false;
+
+      // A virtual environment refuses --user, so fall back to a plain install.
+      for (const extra of [["--user"], []]) {
+        const result = await pipInstall(exe, packages, extra);
+        if (result.code === 0) return { ok: true, python: exe };
+        last = result;
+        const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+        // On a PEP 668 interpreter both attempts fail with the same hint; go
+        // straight to the private environment instead of repeating it.
+        if (PEP668_RE.test(output)) {
+          needsVenv = true;
+          break;
+        }
+        // Ubuntu ships python3 without pip and without ensurepip, so no pip
+        // command can succeed there; a private environment is the only way.
+        if (PIP_MISSING_RE.test(output)) {
+          needsVenv = true;
+          break;
+        }
+        if (extra.length) continue;
+      }
+
+      if (needsVenv) {
+        const venv = await installInVenv(exe, packages);
+        if (venv.ok) return venv;
+
+        // Explicit opt-in only: never weaken the OS protection silently. This
+        // cannot rescue a missing pip, so it only applies to PEP 668.
+        const lastOutput = `${last?.stdout ?? ""}\n${last?.stderr ?? ""}`;
+        if (allowBreakSystemPackages && PEP668_RE.test(lastOutput)) {
+          const forced = await pipInstall(exe, packages, ["--break-system-packages"]);
+          if (forced.code === 0) return { ok: true, python: exe };
+          return { ok: false, error: describePipFailure(forced, exe) };
+        }
+        return venv;
+      }
+
+      return { ok: false, error: describePipFailure(last, exe) };
+    };
+
+    const invalidateDeps = (reason) => {
+      deps = {
+        ready: false,
+        checked: false,
+        error: reason || "",
+        missing: [],
+        at: 0,
+      };
+      resolvedExe = null;
     };
 
     /**
      * Make sure python plus the audio packages are usable. Installs whatever is
-     * missing on first use, then caches the answer.
+     * missing on first use, then caches the answer briefly. `force` skips both
+     * the positive and the negative cache, which is what an explicit click does.
      */
-    const ensureDeps = async () => {
-      if (deps.ready) return { ok: true, installed: false, missing: [] };
-      if (!deps.ready && deps.checked && deps.error && Date.now() - deps.at < RETRY_AFTER_MS) {
-        return { ok: false, installed: false, missing: deps.missing, error: deps.error };
+    const ensureDeps = async (force = false) => {
+      const now = Date.now();
+
+      if (!force && deps.ready && now - deps.at < READY_TTL_MS) {
+        return { ok: true, installed: false, missing: [], python: resolvedExe ?? undefined };
+      }
+      if (!force && deps.checked && !deps.ready && deps.error && now - deps.at < RETRY_AFTER_MS) {
+        return {
+          ok: false,
+          installed: false,
+          missing: deps.missing,
+          python: resolvedExe ?? undefined,
+          error: deps.error,
+        };
       }
       if (!existsSync(ENGINE)) {
         deps = {
@@ -254,20 +464,52 @@ export default Plugin.define({
 
       let exe;
       let doctor;
+      let fallback = null;
       let lastError = "";
 
       for (const candidate of execs) {
-        const probe = await spawnCapture(candidate, [ENGINE, "--action", "doctor"], {
-          timeout: 60_000,
-        });
-        if (probe.enoent) continue;
+        const probe = await spawnCapture(candidate, doctorArgs(), { timeout: 60_000 });
         const parsed = parseEngineOutput(probe.stdout);
-        if (parsed) {
+
+        if (probe.enoent) {
+          lastError = `"${candidate}" was not found`;
+          continue;
+        }
+        if (!parsed && isStoreStub(probe)) {
+          lastError = storeStubMessage(candidate);
+          continue;
+        }
+        if (!parsed) {
+          lastError =
+            lastLine(probe.stderr) ||
+            (probe.timedOut
+              ? `"${candidate}" did not answer in 60 seconds`
+              : `"${candidate}" could not run the voice engine`);
+          continue;
+        }
+
+        if (parsed.ready) {
           exe = candidate;
           doctor = parsed;
           break;
         }
-        lastError = lastLine(probe.stderr) || `"${candidate}" could not run the voice engine`;
+
+        // Keep looking for a ready interpreter (for example a private venv
+        // from an earlier PEP 668 install) before settling on this one.
+        if (!fallback || (fallback.parsed.missing?.length && !parsed.missing?.length)) {
+          fallback = { candidate, parsed };
+        }
+      }
+
+      if (!exe && fallback) {
+        exe = fallback.candidate;
+        doctor = fallback.parsed;
+      }
+
+      if (exe && doctor) {
+        // The shim may resolve to a different absolute interpreter; caching the
+        // resolved path keeps `ensure` and `transcribe` on the same one.
+        resolvedExe = doctor.executable || exe;
       }
 
       if (!exe || !doctor) {
@@ -285,7 +527,7 @@ export default Plugin.define({
 
       if (doctor.ready) {
         deps = { ready: true, checked: true, at: Date.now(), missing: [], error: "" };
-        return { ok: true, installed: false, missing: [] };
+        return { ok: true, installed: false, missing: [], python: resolvedExe ?? undefined };
       }
 
       if (doctor.missing?.length) {
@@ -306,17 +548,39 @@ export default Plugin.define({
           };
         }
 
-        const recheck = await spawnCapture(exe, [ENGINE, "--action", "doctor"], { timeout: 60_000 });
+        if (install.python) resolvedExe = install.python;
+
+        // Recheck with the interpreter that actually received the packages.
+        const recheckExe = install.python || exe;
+        const recheck = await spawnCapture(recheckExe, doctorArgs(), { timeout: 60_000 });
         const after = parseEngineOutput(recheck.stdout);
+
+        if (after?.executable) resolvedExe = after.executable;
+
         if (after?.ready) {
           deps = { ready: true, checked: true, at: Date.now(), missing: [], error: "" };
-          return { ok: true, installed: true, missing: [] };
+          return { ok: true, installed: true, missing: [], python: resolvedExe ?? undefined };
         }
+
+        const audioError = after?.audio_error || doctor.audio_error;
+        const error = audioError
+          ? `the audio system is not ready: ${audioError}`
+          : `the voice libraries were installed but the engine is not ready` +
+            (after?.missing?.length ? ` (missing: ${after.missing.join(", ")})` : "");
+
+        deps = {
+          ready: false,
+          checked: true,
+          at: Date.now(),
+          missing: after?.missing ?? doctor.missing ?? [],
+          error,
+        };
+        return { ok: false, installed: false, missing: deps.missing, error };
       }
 
       const audioError = doctor.audio_error;
       const error = audioError
-        ? `no microphone available: ${audioError}`
+        ? `the audio system is not ready: ${audioError}`
         : "the voice libraries are installed but the engine is not ready";
 
       deps = {
@@ -329,13 +593,16 @@ export default Plugin.define({
       return { ok: false, installed: false, missing: deps.missing, error };
     };
 
-    const ensureOnce = () => {
-      if (!ensureInFlight) {
-        ensureInFlight = ensureDeps().finally(() => {
-          ensureInFlight = null;
-        });
-      }
-      return ensureInFlight;
+    const ensureOnce = (force = false) => {
+      // A check already in flight is the freshest answer available; starting a
+      // second one would run two pip processes at the same time.
+      if (ensureInFlight) return ensureInFlight;
+
+      const pending = ensureDeps(force).finally(() => {
+        if (ensureInFlight === pending) ensureInFlight = null;
+      });
+      ensureInFlight = pending;
+      return pending;
     };
 
     const record = async (input) => {
@@ -356,8 +623,8 @@ export default Plugin.define({
           typeof request.language === "string" && request.language.trim()
             ? request.language.trim()
             : defaultLanguage;
-        const silence = typeof request.silence === "number" ? request.silence : defaultSilence;
-        const timeout = typeof request.timeout === "number" ? request.timeout : defaultTimeout;
+        const silence = numberOption(request.silence, defaultSilence, 0.3, 10);
+        const timeout = numberOption(request.timeout, defaultTimeout, 5, 300);
 
         const args = [
           ENGINE,
@@ -370,22 +637,32 @@ export default Plugin.define({
           "--timeout",
           String(timeout),
         ];
+        if (inputDevice) args.push("--device", inputDevice);
+        if (sampleRate > 0) args.push("--sample-rate", String(sampleRate));
+        if (customFixes.length) args.push("--custom-fixes-json", JSON.stringify(customFixes));
+        if (!autoFixTerms) args.push("--no-auto-fix");
 
         let attempt = 0;
         let settled = false;
 
+        /** @type {import("node:child_process").ChildProcess | undefined} */
+        let child;
+        /** @type {NodeJS.Timeout | undefined} */
+        let killer;
+
         const finish = (result) => {
           if (settled) return;
           settled = true;
-          if (active === child) active = null;
+          if (killer) clearTimeout(killer);
+          if (active === child) {
+            active = null;
+            activePhase = "";
+          }
           resolve(result);
         };
 
-        /** @type {import("node:child_process").ChildProcess | undefined} */
-        let child;
-
         const launch = () => {
-          const exe = execs[attempt];
+          const exe = resolvedExe ?? execs[attempt] ?? execs[0];
 
           child = spawn(exe, args, {
             cwd: HERE,
@@ -394,20 +671,45 @@ export default Plugin.define({
             env: { ...process.env, PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1" },
           });
           active = child;
+          activePhase = "recording";
+
+          // A hung network request must not poison the plugin forever: without
+          // this, `active` would stay set and every later dictation would be
+          // rejected with "a recording is already in progress".
+          killer = setTimeout(() => {
+            try {
+              child?.kill();
+            } catch {
+              /* already gone */
+            }
+            finish({
+              text: "",
+              language,
+              error: `the speech service did not respond within ${timeout + WATCHDOG_GRACE_SECONDS} seconds`,
+            });
+          }, (timeout + WATCHDOG_GRACE_SECONDS) * 1000);
+          killer.unref?.();
 
           let stdout = "";
           let stderr = "";
 
           child.stdout?.on("data", (chunk) => {
             stdout += chunk.toString("utf8");
+            // The engine streams progress markers before the JSON result, so
+            // the pill can say "transcribing" while the network call runs.
+            // Matching on the accumulated text avoids false negatives when a
+            // marker is split across two chunks.
+            if (stdout.includes("__STATUS_PROCESSING__")) activePhase = "processing";
           });
           child.stderr?.on("data", (chunk) => {
             stderr += chunk.toString("utf8");
           });
 
           child.on("error", (error) => {
+            if (settled) return;
+            if (sameExecutable(exe, resolvedExe)) resolvedExe = null;
             // Try the next interpreter when this one does not exist.
-            if (error && error.code === "ENOENT" && attempt + 1 < execs.length) {
+            if (error?.code === "ENOENT" && attempt + 1 < execs.length) {
               attempt += 1;
               active = null;
               launch();
@@ -420,19 +722,30 @@ export default Plugin.define({
           });
 
           child.on("close", () => {
+            if (settled) return;
             const parsed = parseEngineOutput(stdout);
 
             if (parsed) {
-              if (parsed.success === false) {
+              const failure = parsed.success === false;
+              const errorText = failure ? parsed.error || "no speech detected" : "";
+
+              if (failure) {
+                const dependencyFailure =
+                  parsed.code === "DEPENDENCY_ERROR" || DEPENDENCY_FAILURE_RE.test(errorText);
+                if (dependencyFailure) invalidateDeps(errorText);
                 finish({
                   text: "",
                   raw: parsed.raw_text ?? "",
                   duration: parsed.duration ?? 0,
                   language,
-                  error: parsed.error || "no speech detected",
+                  code: parsed.code,
+                  error: errorText,
                 });
                 return;
               }
+
+              // Remember the interpreter that actually produced a result.
+              resolvedExe = exe;
               finish({
                 text: typeof parsed.text === "string" ? parsed.text : "",
                 raw: parsed.raw_text ?? "",
@@ -442,12 +755,25 @@ export default Plugin.define({
               return;
             }
 
-            const tail = stderr.trim().split(/\r?\n/).filter(Boolean).pop();
+            const combined = `${stderr}\n${stdout}`;
+            if (DEPENDENCY_FAILURE_RE.test(combined)) {
+              invalidateDeps(lastLine(stderr));
+            }
+
+            // A Store stub can exist on PATH without being a working Python.
+            if (attempt + 1 < execs.length && isStoreStub({ stdout, stderr })) {
+              if (sameExecutable(exe, resolvedExe)) resolvedExe = null;
+              attempt += 1;
+              active = null;
+              launch();
+              return;
+            }
+
             finish({
               text: "",
               language,
               error:
-                tail ||
+                lastLine(stderr) ||
                 "the voice engine returned no result (is python plus sounddevice and SpeechRecognition installed?)",
             });
           });
@@ -459,7 +785,7 @@ export default Plugin.define({
 
     try {
       await ctx.rpc.register(Voice, {
-        ensure: async () => ensureOnce(),
+        ensure: async (input) => ensureOnce(input?.force === true),
         transcribe: async (input) => record(input),
         stop: async () => {
           if (active?.stdin?.writable) {
@@ -472,34 +798,107 @@ export default Plugin.define({
           return { ok: true };
         },
         status: async () => {
-          return { recording: active !== null };
+          return { recording: active !== null, phase: active ? activePhase || "recording" : "idle" };
         },
       });
     } catch (error) {
       console.error("[opencode-voice-prompt] could not register the voice RPC:", error);
     }
 
-    // Also expose voice input as a model tool, so an agent can ask for dictation.
-    try {
-      await ctx.tool.transform((editor) => {
-        editor.add({
-          name: "voice_input",
-          description:
-            "Record the user's microphone, transcribe the speech, and return the text. Language defaults to the plugin configuration (ar-SA).",
-          input: {
-            type: "object",
-            properties: {
-              language: { type: "string", description: "BCP-47 language tag, e.g. ar-SA or en-US" },
+    // The agent-facing tool can open the microphone, so it is opt-in and asks
+    // for permission on every call.
+    if (allowAgentRecording) {
+      try {
+        await ctx.tool.transform((editor) => {
+          editor.add({
+            name: "voice_input",
+            description:
+              "Record the user's microphone, transcribe the speech, and return the text. " +
+              "Use it only when the user explicitly asks for dictation. Language defaults to the plugin configuration (ar-SA).",
+            input: {
+              type: "object",
+              properties: {
+                language: { type: "string", description: "BCP-47 language tag, e.g. ar-SA or en-US" },
+              },
+              additionalProperties: false,
             },
-          },
-          execute: async (input) => {
-            const result = await record(input);
-            return { content: result.text || `(no speech captured: ${result.error ?? "unknown error"})` };
-          },
+            execute: async (input, context) => {
+              if (ctx.permission?.assert && context?.sessionID) {
+                await ctx.permission.assert({
+                  sessionID: context.sessionID,
+                  agent: context.agent,
+                  source: {
+                    type: "tool",
+                    messageID: context.messageID,
+                    id: context.id,
+                  },
+                  action: "voice.record",
+                  resources: ["microphone"],
+                  save: ["voice.record"],
+                });
+              }
+
+              const result = await record(input);
+              return {
+                content: result.text || `(no speech captured: ${result.error ?? "unknown error"})`,
+              };
+            },
+          });
         });
-      });
-    } catch (error) {
-      console.error("[opencode-voice-prompt] could not register the voice_input tool:", error);
+      } catch (error) {
+        console.error("[opencode-voice-prompt] could not register the voice_input tool:", error);
+      }
     }
+
+    // Kill an in-flight recorder when the plugin unloads or reloads. Without
+    // this the microphone could stay open with no UI left to stop it.
+    return () => {
+      try {
+        if (active) active.kill();
+      } catch {
+        /* already gone */
+      }
+      active = null;
+    };
   },
 });
+
+function numberOption(value, fallback, min, max) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(max, Math.max(min, number));
+}
+
+function normalizeFixes(value) {
+  if (!Array.isArray(value)) return [];
+  const fixes = [];
+  for (const item of value) {
+    if (!Array.isArray(item) || item.length < 2) continue;
+    const [spoken, replacement] = item;
+    if (typeof spoken !== "string" || !spoken || typeof replacement !== "string" || !replacement) {
+      continue;
+    }
+    fixes.push([spoken, replacement]);
+  }
+  return fixes;
+}
+
+function isStoreStub(result) {
+  return STORE_STUB_RE.test(`${result?.stdout ?? ""}\n${result?.stderr ?? ""}`);
+}
+
+function storeStubMessage(exe) {
+  return (
+    `"${exe}" is the Microsoft Store alias for Python, which is not a working interpreter. ` +
+    `Install Python from python.org (or disable the alias in Settings > Apps > App execution aliases), ` +
+    `or set the "python" plugin option to a real python.exe.`
+  );
+}
+
+function pep668Message(exe) {
+  return (
+    `"${exe}" is managed by the operating system (PEP 668), so pip cannot install into it. ` +
+    `The plugin tried to create a private environment instead; if that also failed, install python3-venv ` +
+    `(Debian/Ubuntu) or set the "python" option to a virtualenv interpreter.`
+  );
+}

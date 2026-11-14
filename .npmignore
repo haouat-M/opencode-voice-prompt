@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+*.tgz
+.pytest_cache/
+.venv/
+venv/
+.github/
+node_modules/
