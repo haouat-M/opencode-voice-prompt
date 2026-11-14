@@ -12,6 +12,7 @@ const messages = {
   en: {
     "voice.label": "Voice",
     "voice.recording": "Recording… click to stop",
+    "voice.setup": "Preparing voice… (installing libraries on first use)",
     "voice.hint": "Dictate into the prompt",
     "voice.command": "Voice: dictate into the prompt",
     "voice.command.description": "Record speech and insert the transcription into the prompt",
@@ -21,6 +22,7 @@ const messages = {
   ar: {
     "voice.label": "صوت",
     "voice.recording": "… يتم التسجيل — اضغط للإيقاف",
+    "voice.setup": "… جارٍ تجهيز الصوت (تنصيب المكتبات أول مرة)",
     "voice.hint": "أملِ في خانة الكتابة",
     "voice.command": "صوت: إملاء داخل خانة الكتابة",
     "voice.command.description": "تسجيل الكلام وإدراج التفريغ في خانة الكتابة",
@@ -62,6 +64,19 @@ const Voice =
     ? rpcSdk.Rpc.define({
         id: "voice",
         methods: {
+          ensure: {
+            input: { type: "object", properties: {} },
+            output: {
+              type: "object",
+              properties: {
+                ok: { type: "boolean" },
+                installed: { type: "boolean" },
+                missing: { type: "array" },
+                error: { type: "string" },
+              },
+              required: ["ok"],
+            },
+          },
           transcribe: {
             input: {
               type: "object",
@@ -151,9 +166,17 @@ function build() {
 
         busy = true;
         setNote("");
-        setPhase("recording");
+        setPhase("setup");
 
         try {
+          // First run on this machine may install the Python audio libraries.
+          const ready = await ctx.client.rpc(Voice).ensure({});
+          if (!ready?.ok) {
+            flash(ready?.error || t("voice.setup"));
+            return;
+          }
+
+          setPhase("recording");
           const result = await ctx.client.rpc(Voice).transcribe({});
           const text = typeof result?.text === "string" ? result.text.trim() : "";
 
@@ -193,6 +216,14 @@ function build() {
                 label: `⚠ ${pending}`,
                 tone: "danger",
                 title: pending,
+                run: () => void dictate(),
+              };
+            }
+            if (current === "setup") {
+              return {
+                label: `⚙ ${t("voice.setup")}`,
+                tone: "warning",
+                title: t("voice.setup"),
                 run: () => void dictate(),
               };
             }

@@ -7,7 +7,13 @@ import json
 import wave
 import argparse
 import threading
-import numpy as np
+
+# The doctor action must work even when the audio stack is missing, so numpy is
+# imported lazily: record_and_transcribe imports it again for real use.
+try:
+    import numpy as np
+except Exception:
+    np = None
 
 # Force UTF-8 encoding on Windows to prevent charmap codec errors
 if sys.platform == "win32":
@@ -144,6 +150,7 @@ def apply_fixes(text, custom_fixes=None):
 def record_and_transcribe(language="ar-SA", timeout=90, silence_seconds=2.2, custom_fixes=None):
     import sounddevice as sd
     import speech_recognition as sr
+    import numpy as np
 
     sample_rate = 16000
     channels = 1
@@ -269,9 +276,43 @@ def record_and_transcribe(language="ar-SA", timeout=90, silence_seconds=2.2, cus
         res = {"success": False, "error": str(e), "code": "UNKNOWN_ERROR"}
         print(f"__JSON_START__{json.dumps(res, ensure_ascii=False)}__JSON_END__", flush=True)
 
+REQUIRED_MODULES = (
+    ("numpy", "numpy"),
+    ("sounddevice", "sounddevice"),
+    ("speech_recognition", "SpeechRecognition"),
+)
+
+def doctor():
+    """Report the interpreter and which audio packages are still missing."""
+    missing = []
+    for module, pip_name in REQUIRED_MODULES:
+        try:
+            __import__(module)
+        except Exception:
+            missing.append(pip_name)
+
+    info = {
+        "success": True,
+        "ready": not missing,
+        "missing": missing,
+        "python": sys.version.split()[0],
+        "executable": sys.executable,
+    }
+
+    if not missing:
+        try:
+            import sounddevice as sd
+            info["default_input"] = sd.query_devices(kind="input")["name"]
+        except Exception as e:
+            info["audio_error"] = str(e)
+            info["ready"] = False
+            info["missing"] = []
+
+    print(f"__JSON_START__{json.dumps(info, ensure_ascii=False)}__JSON_END__", flush=True)
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fast Arabic Voice Transcriber")
-    parser.add_argument("--action", choices=["record", "test", "fix"], default="record")
+    parser.add_argument("--action", choices=["record", "test", "fix", "doctor"], default="record")
     parser.add_argument("--language", type=str, default="ar-SA")
     parser.add_argument("--timeout", type=int, default=90)
     parser.add_argument("--silence", type=float, default=2.2)
@@ -294,6 +335,8 @@ if __name__ == "__main__":
             silence_seconds=args.silence,
             custom_fixes=custom_fixes
         )
+    elif args.action == "doctor":
+        doctor()
     elif args.action == "fix":
         # Offline check of the terminology fixer, no microphone involved.
         res = {

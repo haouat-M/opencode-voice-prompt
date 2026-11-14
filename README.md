@@ -48,32 +48,32 @@ developer-term conversion (`Docker`, `Git`, `Python`, `React`, …).
 
 ### 1. Prerequisites
 
-Ensure **Python 3.8+** is installed:
+The only requirement is **Python 3.8+** on your `PATH`:
 
 ```bash
 python --version
 ```
 
-Install the audio and speech libraries:
+You do **not** need to install any Python package by hand: on the first
+dictation the plugin checks for `SpeechRecognition`, `sounddevice` and `numpy`,
+installs whatever is missing with pip, and then starts recording. That first run
+takes a few extra seconds and needs an internet connection; every run after it
+is instant.
 
-```bash
-pip install SpeechRecognition sounddevice numpy
-```
-
-`pyperclip`, `keyboard`, `psutil` and `tkinter` are only needed by the optional
-floating widget.
+> If `python` is not on your `PATH`, set the interpreter explicitly with the
+> `python` plugin option or the `OPENCODE_VOICE_PYTHON` environment variable.
 
 ---
 
 ### 2. Add the plugin to OpenCode
 
-Either install it as a package:
+From the repository:
 
 ```bash
 opencode plugin add github:haouat-M/opencode-voice-prompt
 ```
 
-or point the config at a local checkout in `~/.config/opencode/opencode.json`:
+or from a local clone, in `~/.config/opencode/opencode.json`:
 
 ```json
 {
@@ -132,9 +132,14 @@ The server part exposes the `voice` RPC:
 
 | Method       | Input                             | Output                                        |
 | ------------ | --------------------------------- | --------------------------------------------- |
+| `ensure`     | `{}`                              | `{ ok, installed, missing?, error? }`         |
 | `transcribe` | `{ language?, silence?, timeout? }` | `{ text, raw?, duration?, language?, error? }` |
 | `stop`       | `{}`                              | `{ ok }`                                       |
 | `status`     | `{}`                              | `{ recording }`                                |
+
+`ensure` verifies Python and the audio packages, installing anything missing on
+the first call. It is safe to call before every dictation: after the first
+success it returns `{ ok: true, installed: false }` in milliseconds.
 
 Call it over HTTP:
 

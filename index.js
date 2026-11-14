@@ -23,6 +23,17 @@ const TRANSCRIBE_OUTPUT = {
   required: ["text"],
 };
 
+const ENSURE_OUTPUT = {
+  type: "object",
+  properties: {
+    ok: { type: "boolean" },
+    installed: { type: "boolean" },
+    missing: { type: "array" },
+    error: { type: "string" },
+  },
+  required: ["ok"],
+};
+
 /**
  * Token shared with the GUI part (gui-experimental.cjs). Both files must declare
  * the same id and the same method shapes.
@@ -30,6 +41,10 @@ const TRANSCRIBE_OUTPUT = {
 export const Voice = Rpc.define({
   id: "voice",
   methods: {
+    ensure: {
+      input: { type: "object", properties: {} },
+      output: ENSURE_OUTPUT,
+    },
     transcribe: {
       input: {
         type: "object",
@@ -92,6 +107,87 @@ function pythonCandidates(options) {
   return [...new Set(list)];
 }
 
+/** Python packages the engine needs, in pip spelling. */
+const PIP_PACKAGES = ["SpeechRecognition", "sounddevice", "numpy"];
+
+/** A pip install can take a while on a cold machine. */
+const INSTALL_TIMEOUT_MS = 5 * 60 * 1000;
+
+/** After a failed setup, wait this long before trying to install again. */
+const RETRY_AFTER_MS = 5 * 60 * 1000;
+
+/**
+ * Run a process and collect its output. Never rejects: a missing interpreter is
+ * reported as `enoent` so the caller can try the next candidate.
+ */
+function spawnCapture(exe, args, options = {}) {
+  return new Promise((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    let done = false;
+    /** @type {NodeJS.Timeout | null} */
+    let timer = null;
+
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer);
+      resolve(result);
+    };
+
+    let child;
+    try {
+      child = spawn(exe, args, {
+        cwd: HERE,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1" },
+      });
+    } catch (error) {
+      resolve({ enoent: true, code: -1, stdout, stderr: String(error?.message ?? error) });
+      return;
+    }
+
+    if (options.timeout) {
+      timer = setTimeout(() => {
+        try {
+          child.kill();
+        } catch {
+          /* already gone */
+        }
+      }, options.timeout);
+    }
+
+    child.stdout?.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+
+    child.on("error", (error) => {
+      finish({
+        enoent: error?.code === "ENOENT",
+        code: -1,
+        stdout,
+        stderr: String(error?.message ?? error),
+      });
+    });
+
+    child.on("close", (code) => {
+      finish({ enoent: false, code: code ?? 0, stdout, stderr });
+    });
+  });
+}
+
+function lastLine(text) {
+  return String(text ?? "")
+    .trim()
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .pop();
+}
+
 export default Plugin.define({
   id: "opencode-voice-prompt",
 
@@ -106,19 +202,151 @@ export default Plugin.define({
     /** @type {import("node:child_process").ChildProcess | null} */
     let active = null;
 
-    const record = (input) => {
+    /** Cached result of the last dependency check. */
+    let deps = { ready: false, checked: false, error: "", missing: /** @type {string[]} */ ([]), at: 0 };
+
+    /** Shared in-flight check so two clicks never run pip at the same time. */
+    let ensureInFlight = null;
+
+    const installDeps = async (exe, missing) => {
+      const packages = missing.length ? missing : PIP_PACKAGES;
+      const base = ["-m", "pip", "install", "--disable-pip-version-check", "--no-input"];
+
+      // A virtual environment refuses --user, so fall back to a plain install.
+      for (const args of [
+        [...base, "--user", ...packages],
+        [...base, ...packages],
+      ]) {
+        const result = await spawnCapture(exe, args, { timeout: INSTALL_TIMEOUT_MS });
+        if (result.code === 0) return { ok: true };
+        const tail = lastLine(result.stderr);
+        if (args.includes("--user")) continue;
+        return { ok: false, error: tail || `pip exited with code ${result.code}` };
+      }
+
+      return { ok: false, error: "pip could not install the voice libraries" };
+    };
+
+    /**
+     * Make sure python plus the audio packages are usable. Installs whatever is
+     * missing on first use, then caches the answer.
+     */
+    const ensureDeps = async () => {
+      if (deps.ready) return { ok: true, installed: false, missing: [] };
+      if (!deps.ready && deps.checked && deps.error && Date.now() - deps.at < RETRY_AFTER_MS) {
+        return { ok: false, installed: false, missing: deps.missing, error: deps.error };
+      }
+      if (!existsSync(ENGINE)) {
+        deps = {
+          ready: false,
+          checked: true,
+          at: Date.now(),
+          missing: [],
+          error: `voice engine not found at ${ENGINE}`,
+        };
+        return { ok: false, installed: false, missing: [], error: deps.error };
+      }
+
+      let exe;
+      let doctor;
+      let lastError = "";
+
+      for (const candidate of execs) {
+        const probe = await spawnCapture(candidate, [ENGINE, "--action", "doctor"], {
+          timeout: 60_000,
+        });
+        if (probe.enoent) continue;
+        const parsed = parseEngineOutput(probe.stdout);
+        if (parsed) {
+          exe = candidate;
+          doctor = parsed;
+          break;
+        }
+        lastError = lastLine(probe.stderr) || `"${candidate}" could not run the voice engine`;
+      }
+
+      if (!exe || !doctor) {
+        deps = {
+          ready: false,
+          checked: true,
+          at: Date.now(),
+          missing: [],
+          error:
+            lastError ||
+            "python was not found; install Python 3.8+ and put it on PATH, or set OPENCODE_VOICE_PYTHON",
+        };
+        return { ok: false, installed: false, missing: [], error: deps.error };
+      }
+
+      if (doctor.ready) {
+        deps = { ready: true, checked: true, at: Date.now(), missing: [], error: "" };
+        return { ok: true, installed: false, missing: [] };
+      }
+
+      if (doctor.missing?.length) {
+        const install = await installDeps(exe, doctor.missing);
+        if (!install.ok) {
+          deps = {
+            ready: false,
+            checked: true,
+            at: Date.now(),
+            missing: doctor.missing,
+            error: install.error,
+          };
+          return {
+            ok: false,
+            installed: false,
+            missing: doctor.missing,
+            error: install.error,
+          };
+        }
+
+        const recheck = await spawnCapture(exe, [ENGINE, "--action", "doctor"], { timeout: 60_000 });
+        const after = parseEngineOutput(recheck.stdout);
+        if (after?.ready) {
+          deps = { ready: true, checked: true, at: Date.now(), missing: [], error: "" };
+          return { ok: true, installed: true, missing: [] };
+        }
+      }
+
+      const audioError = doctor.audio_error;
+      const error = audioError
+        ? `no microphone available: ${audioError}`
+        : "the voice libraries are installed but the engine is not ready";
+
+      deps = {
+        ready: false,
+        checked: true,
+        at: Date.now(),
+        missing: doctor.missing ?? [],
+        error,
+      };
+      return { ok: false, installed: false, missing: deps.missing, error };
+    };
+
+    const ensureOnce = () => {
+      if (!ensureInFlight) {
+        ensureInFlight = ensureDeps().finally(() => {
+          ensureInFlight = null;
+        });
+      }
+      return ensureInFlight;
+    };
+
+    const record = async (input) => {
       const request = input ?? {};
 
-      return new Promise((resolve) => {
-        if (active) {
-          resolve({ text: "", error: "a recording is already in progress" });
-          return;
-        }
-        if (!existsSync(ENGINE)) {
-          resolve({ text: "", error: `voice engine not found at ${ENGINE}` });
-          return;
-        }
+      if (active) return { text: "", error: "a recording is already in progress" };
+      if (!existsSync(ENGINE)) return { text: "", error: `voice engine not found at ${ENGINE}` };
 
+      const ready = await ensureOnce();
+      if (!ready.ok) {
+        return { text: "", error: ready.error || "the voice dependencies are not installed" };
+      }
+      // A second call may have started while the dependency check was running.
+      if (active) return { text: "", error: "a recording is already in progress" };
+
+      return new Promise((resolve) => {
         const language =
           typeof request.language === "string" && request.language.trim()
             ? request.language.trim()
@@ -226,6 +454,7 @@ export default Plugin.define({
 
     try {
       await ctx.rpc.register(Voice, {
+        ensure: async () => ensureOnce(),
         transcribe: async (input) => record(input),
         stop: async () => {
           if (active?.stdin?.writable) {
