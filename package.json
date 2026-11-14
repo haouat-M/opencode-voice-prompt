@@ -1,0 +1,43 @@
+{
+  "name": "opencode-voice-prompt",
+  "version": "2.0.0",
+  "description": "In-app voice dictation for OpenCode Desktop: a microphone pill above the prompt composer that inserts Arabic/multilingual speech into the prompt",
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./gui-experimental": "./gui-experimental.cjs"
+  },
+  "files": [
+    "index.js",
+    "gui-experimental.cjs",
+    "scripts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "check": "node --check index.js && node --check gui-experimental.cjs"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "voice",
+    "speech-to-text",
+    "arabic",
+    "dictation",
+    "speech",
+    "developer-tools"
+  ],
+  "author": "haouat-M",
+  "license": "MIT",
+  "dependencies": {
+    "@opencode/plugin": "latest"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/haouat-M/opencode-voice-prompt.git"
+  },
+  "bugs": {
+    "url": "https://github.com/haouat-M/opencode-voice-prompt/issues"
+  },
+  "homepage": "https://github.com/haouat-M/opencode-voice-prompt#readme"
+}
