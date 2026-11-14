@@ -100,9 +100,14 @@ function pythonCandidates(options) {
   if (process.env.OPENCODE_VOICE_PYTHON) {
     list.push(process.env.OPENCODE_VOICE_PYTHON);
   }
-  // 3. Whatever is first on PATH (Windows also exposes "py").
+  // 3. Whatever is first on PATH. macOS and most Linux distributions ship
+  //    "python3" without a "python" alias; Windows also exposes "py".
   list.push("python");
-  if (process.platform === "win32") list.push("py");
+  if (process.platform === "win32") {
+    list.push("py");
+  } else {
+    list.push("python3");
+  }
 
   return [...new Set(list)];
 }
@@ -273,7 +278,7 @@ export default Plugin.define({
           missing: [],
           error:
             lastError ||
-            "python was not found; install Python 3.8+ and put it on PATH, or set OPENCODE_VOICE_PYTHON",
+            "python was not found; install Python 3.8+ and put it on PATH (python or python3), or set OPENCODE_VOICE_PYTHON",
         };
         return { ok: false, installed: false, missing: [], error: deps.error };
       }

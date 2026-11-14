@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![OpenCode Plugin](https://img.shields.io/badge/OpenCode-Plugin-green.svg)](https://opencode.ai)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)]()
+[![Platform](https://img.shields.io/badge/Platform-Windows%20(tested)-lightgrey.svg)]()
 [![Python 3.8+](https://img.shields.io/badge/Python-3.8+-yellow.svg)](https://www.python.org/)
 
 Hands-free voice dictation for **OpenCode Desktop**. The microphone button lives
@@ -39,7 +39,7 @@ developer-term conversion (`Docker`, `Git`, `Python`, `React`, …).
   - Server part registers the `voice` RPC and the `voice_input` model tool.
   - GUI part contributes the composer pill and the command.
 - 🪶 **Optional fallback widget**:
-  - `floating_mic.py` still exists for OpenCode CLI users, but it never starts
+  - `legacy/floating_mic.py` is kept for OpenCode CLI users, but it never starts
     on its own; run it manually if you want it.
 
 ---
@@ -62,6 +62,19 @@ is instant.
 
 > If `python` is not on your `PATH`, set the interpreter explicitly with the
 > `python` plugin option or the `OPENCODE_VOICE_PYTHON` environment variable.
+> `python3` is picked up automatically on macOS and Linux.
+
+**Linux:** `sounddevice` needs the PortAudio shared library, which pip cannot
+install:
+
+```bash
+sudo apt install libportaudio2        # Debian/Ubuntu
+sudo dnf install portaudio            # Fedora
+```
+
+**macOS:** PortAudio is bundled with the `sounddevice` wheel, but the terminal
+running OpenCode needs microphone permission (System Settings → Privacy →
+Microphone).
 
 ---
 
@@ -118,11 +131,16 @@ opencode-voice-prompt/
 ├── gui-experimental.cjs    # GUI part: composer pill + /voice command
 ├── scripts/
 │   └── engine.py           # Recording, silence detection, STT, term fixer
-├── floating_mic.py         # Optional standalone widget (manual start only)
-├── Start_OpenCode_Voice.bat
 ├── package.json
-└── README.md
+├── README.md
+└── legacy/                 # Optional v1 extras, not used by the plugin
+    ├── floating_mic.py     # standalone always-on-top widget (manual start)
+    ├── opencode_voice.py   # v1 CLI helper superseded by scripts/engine.py
+    └── Start_OpenCode_Voice.bat
 ```
+
+Only `index.js`, `gui-experimental.cjs` and `scripts/` are loaded by OpenCode;
+`legacy/` is kept for people on the old floating-widget workflow.
 
 ---
 

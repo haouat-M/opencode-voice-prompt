@@ -36,7 +36,7 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-sys.path.append(os.path.join(os.path.dirname(__file__), "scripts"))
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "scripts"))
 try:
     from engine import apply_fixes
 except Exception:  # pragma: no cover - the widget still works without the fixer

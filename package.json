@@ -1,6 +1,6 @@
 {
   "name": "opencode-voice-prompt",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "In-app voice dictation for OpenCode Desktop: a microphone pill above the prompt composer that inserts Arabic/multilingual speech into the prompt",
   "type": "module",
   "exports": {

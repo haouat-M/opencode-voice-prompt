@@ -22,7 +22,7 @@ if sys.platform == "win32":
         pass
 
 # Import phonetic fixes from engine
-sys.path.append(os.path.join(os.path.dirname(__file__), "scripts"))
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "scripts"))
 try:
     from engine import apply_fixes
 except ImportError:
