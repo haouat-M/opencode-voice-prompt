@@ -97,6 +97,7 @@ const Voice =
                 language: { type: "string" },
                 silence: { type: "number" },
                 timeout: { type: "number" },
+                sessionID: { type: "string" },
               },
             },
             output: {
@@ -109,6 +110,18 @@ const Voice =
                 code: { type: "string" },
                 error: { type: "string" },
               },
+              required: ["text"],
+            },
+          },
+          correct: {
+            input: {
+              type: "object",
+              properties: { text: { type: "string" }, sessionID: { type: "string" } },
+              required: ["text"],
+            },
+            output: {
+              type: "object",
+              properties: { text: { type: "string" } },
               required: ["text"],
             },
           },
@@ -249,7 +262,7 @@ function build() {
           }
 
           setPhase("recording");
-          const result = await ctx.client.rpc(Voice).transcribe({});
+          const result = await ctx.client.rpc(Voice).transcribe({ sessionID });
           const text = typeof result?.text === "string" ? result.text.trim() : "";
 
           if (!text) {

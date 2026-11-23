@@ -1,6 +1,6 @@
 {
   "name": "opencode-voice-prompt",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "In-app voice dictation for OpenCode Desktop: a microphone pill above the prompt composer that inserts Arabic/multilingual speech into the prompt",
   "type": "module",
   "exports": {
@@ -9,6 +9,7 @@
   },
   "files": [
     "index.js",
+    "correction.mjs",
     "gui-experimental.cjs",
     "scripts/engine.py",
     "tests/*.py",
@@ -20,8 +21,9 @@
     "LICENSE"
   ],
   "scripts": {
-    "check": "node --check index.js && node --check gui-experimental.cjs",
-    "test": "python -m unittest discover -s tests -v"
+    "check": "node --check index.js && node --check gui-experimental.cjs && node --check correction.mjs",
+    "test": "python -m unittest discover -s tests -v && node --test tests",
+    "test:js": "node --test tests"
   },
   "engines": {
     "node": ">=18"

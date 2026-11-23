@@ -40,6 +40,12 @@ conversion (`Docker`, `GitHub`, `Python`, `React`, …).
   become exact English terms. Ambiguous everyday words such as «جيت» and «بوش»
   are only rewritten next to a real technical term, so normal dictation is not
   corrupted (`autoFixTerms` can turn the whole fixer off).
+- 🧠 **Contextual correction** — before insertion, a model fixes recognition
+  mistakes using the sentence context («كتب صندوق وطلعت كلمة تانية»). It keeps
+  the speaker's own dialect and wording, never translates, and writes
+  English-origin words in English script (إنجلش → `English`, دوكر → `Docker`).
+  Falls back to the uncorrected text if the model is unavailable. Set
+  `contextCorrection: false` to skip it.
 - 🧩 **Native plugin architecture** — the server part registers the `voice` RPC
   (and an opt-in agent tool); the GUI part contributes the pill and command.
 - 🪶 **Optional legacy widget** — `legacy/floating_mic.py` is kept for OpenCode
@@ -149,11 +155,18 @@ clicking the pill cancels it.
 | `sampleRate`                | auto                                 | Force one rate; otherwise 48000 → 44100 → 32000 → 16000 is tried.       |
 | `autoFixTerms`              | `true`                               | Set `false` to keep the raw transcription (useful for prose).           |
 | `fixes`                     | `[]`                                 | Extra `[spoken, replacement]` pairs, e.g. `[["فاست", "Fast"]]`.         |
+| `contextCorrection`         | `true`                               | Fix recognition mistakes in context before insertion; preserves dialect and meaning. |
+| `correctionModel`           | `opencode/hy4-flash-free`             | Optional host model override: `{ "providerID": "…", "id": "…" }` or `"provider/id"`. |
 | `allowAgentRecording`       | `false`                              | Expose the `voice_input` model tool (asks permission on every call).    |
 | `allowBreakSystemPackages`  | `false`                              | Allow pip `--break-system-packages` if a private venv cannot be built.  |
 | `venvPath`                  | `~/.cache/opencode-voice-prompt/venv` | Where the fallback environment is created.                              |
 
-Environment overrides: `OPENCODE_VOICE_PYTHON` and `OPENCODE_VOICE_VENV`.
+Environment overrides: `OPENCODE_VOICE_PYTHON`, `OPENCODE_VOICE_VENV`, and
+`OPENCODE_VOICE_CORRECTION_MODEL` to pick a different host model.
+
+The plugin contains **no API keys** and makes no third-party model calls of its
+own. Correction uses the host application's model API, so each user's own
+OpenCode setup and permissions apply.
 
 Example with a USB microphone and custom terms:
 
@@ -181,9 +194,10 @@ The server part exposes the `voice` RPC:
 | Method       | Input                                | Output                                          |
 | ------------ | ------------------------------------ | ----------------------------------------------- |
 | `ensure`     | `{ force? }`                         | `{ ok, installed, missing?, python?, error? }`  |
-| `transcribe` | `{ language?, silence?, timeout? }`  | `{ text, raw?, duration?, language?, code?, error? }` |
+| `transcribe` | `{ language?, silence?, timeout?, sessionID? }`  | `{ text, raw?, duration?, language?, code?, error? }` |
+| `correct`    | `{ text, sessionID? }`                 | `{ text }` — run the contextual correction without opening the mic (test hook) |
 | `stop`       | `{}`                                 | `{ ok }`                                        |
-| `status`     | `{}`                                 | `{ recording }`                                 |
+| `status`     | `{}`                                 | `{ recording, phase }`                          |
 
 `ensure` verifies Python and the audio packages, installing anything missing on
 the first call. `force: true` bypasses both the positive and the negative cache,
@@ -250,6 +264,13 @@ stays untouched.
 - Audio is sent to Google's free Web Speech endpoint by
   `SpeechRecognition.recognize_google`. No audio is written to disk by the
   plugin; it is buffered in memory as a WAV.
+- With `contextCorrection` enabled, the **text** of the transcription (never the
+  audio) is passed to the host application's model API for cleanup — preferably
+  the focused session's transient generation, which uses the same host model and
+  allowance as chat and is not written to the conversation. No key is stored or
+  read by the plugin, and no third-party endpoint is contacted by the plugin
+  itself. On any failure the uncorrected text is used. Disable the whole step
+  with `contextCorrection: false`.
 - The first dictation may run `pip install` for `SpeechRecognition`,
   `sounddevice` and `numpy`. On a PEP 668 system it creates a private venv in
   `~/.cache/opencode-voice-prompt/venv`.

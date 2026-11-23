@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Plugin } from "@opencode/plugin";
 import { Rpc } from "@opencode/plugin/rpc";
+import { buildCorrectionPrompt, parseCorrection } from "./correction.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ENGINE = path.join(HERE, "scripts", "engine.py");
@@ -25,7 +26,13 @@ const RETRY_AFTER_MS = 30 * 1000;
 const READY_TTL_MS = 5 * 60 * 1000;
 
 /** Extra time the watchdog allows after the engine's own recording timeout. */
-const WATCHDOG_GRACE_SECONDS = 25;
+const WATCHDOG_GRACE_SECONDS = 40;
+
+/** Maximum time allowed for the contextual correction model call. */
+const CORRECTION_TIMEOUT_MS = 8000;
+
+/** Correction runs through the host application's own model API — no keys. */
+const DEFAULT_CORRECTION_MODEL = { providerID: "opencode", id: "hy4-flash-free" };
 
 const PEP668_RE = /externally-managed-environment|EXTERNALLY-MANAGED/i;
 const PIP_MISSING_RE = /No module named pip|pip is not installed|ensurepip is not available/i;
@@ -83,9 +90,24 @@ export const Voice = Rpc.define({
           language: { type: "string" },
           silence: { type: "number" },
           timeout: { type: "number" },
+          // The focused session lets correction run through its transient
+          // generation, which uses the same host model and allowance as chat.
+          sessionID: { type: "string" },
         },
       },
       output: TRANSCRIBE_OUTPUT,
+    },
+    correct: {
+      input: {
+        type: "object",
+        properties: { text: { type: "string" }, sessionID: { type: "string" } },
+        required: ["text"],
+      },
+      output: {
+        type: "object",
+        properties: { text: { type: "string" } },
+        required: ["text"],
+      },
     },
     stop: {
       input: { type: "object", properties: {} },
@@ -273,6 +295,10 @@ export default Plugin.define({
     const autoFixTerms = options.autoFixTerms !== false;
     const allowAgentRecording = options.allowAgentRecording === true;
     const allowBreakSystemPackages = options.allowBreakSystemPackages === true;
+    const contextCorrection = options.contextCorrection !== false;
+    const correctionModel = normalizeCorrectionModel(
+      options.correctionModel ?? process.env.OPENCODE_VOICE_CORRECTION_MODEL,
+    );
     const venvPath = resolveVenvPath(options);
     const execs = pythonCandidates(options);
     const cachedVenvPython = venvPython(venvPath);
@@ -605,6 +631,71 @@ export default Plugin.define({
       return pending;
     };
 
+    /**
+     * Fix recognition mistakes in context without translating, changing the
+     * speaker's dialect, or inventing content. English-origin words are written
+     * in Latin script. Any failure simply returns the engine's own text.
+     */
+    const correctText = async (text, sessionID) => {
+      if (!contextCorrection || !text) return text;
+      const prompt = buildCorrectionPrompt(text, customFixes);
+      let raw = "";
+
+      // Preferred: the focused session's transient generation. It uses the
+      // host model and the session's allowance, and is not written to history.
+      // The plugin ships no keys and never talks to a third-party endpoint.
+      try {
+        if (sessionID && typeof ctx.session?.generate === "function") {
+          const answer = await withTimeout(
+            ctx.session.generate({ sessionID, prompt }),
+            CORRECTION_TIMEOUT_MS,
+          );
+          raw = typeof answer === "string" ? answer : answer?.text;
+        }
+      } catch (error) {
+        console.error(
+          "[opencode-voice-prompt] session correction failed:",
+          error?.message ?? String(error),
+        );
+      }
+
+      // Fallback: the host's experimental generate API, when there is no session.
+      if (!parseCorrection(raw, text)) {
+        const generate =
+          typeof ctx.experimental?.generate?.text === "function"
+            ? ctx.experimental.generate.text.bind(ctx.experimental.generate)
+            : typeof ctx.generate?.text === "function"
+              ? ctx.generate.text.bind(ctx.generate)
+              : null;
+        if (generate) {
+          try {
+            const answer = await withTimeout(
+              generate({
+                prompt,
+                model: correctionModel ?? DEFAULT_CORRECTION_MODEL,
+              }),
+              CORRECTION_TIMEOUT_MS,
+            );
+            raw = typeof answer === "string" ? answer : answer?.text;
+          } catch (error) {
+            console.error(
+              "[opencode-voice-prompt] host correction failed:",
+              error?.message ?? String(error),
+            );
+          }
+        }
+      }
+
+      const corrected = parseCorrection(raw, text);
+      if (!corrected) {
+        console.error(
+          "[opencode-voice-prompt] correction reply rejected:",
+          JSON.stringify(raw ?? null).slice(0, 500),
+        );
+      }
+      return corrected || text;
+    };
+
     const record = async (input) => {
       const request = input ?? {};
 
@@ -721,7 +812,7 @@ export default Plugin.define({
             });
           });
 
-          child.on("close", () => {
+          child.on("close", async () => {
             if (settled) return;
             const parsed = parseEngineOutput(stdout);
 
@@ -746,8 +837,18 @@ export default Plugin.define({
 
               // Remember the interpreter that actually produced a result.
               resolvedExe = exe;
+
+              // The engine has exited. Stop its watchdog before the model
+              // call, so a slow model cannot be killed and leave the RPC stuck.
+              if (killer) {
+                clearTimeout(killer);
+                killer = null;
+              }
+
+              const original = typeof parsed.text === "string" ? parsed.text : "";
+              const corrected = await correctText(original, request.sessionID);
               finish({
-                text: typeof parsed.text === "string" ? parsed.text : "",
+                text: corrected,
                 raw: parsed.raw_text ?? "",
                 duration: parsed.duration ?? 0,
                 language: parsed.language ?? language,
@@ -787,6 +888,13 @@ export default Plugin.define({
       await ctx.rpc.register(Voice, {
         ensure: async (input) => ensureOnce(input?.force === true),
         transcribe: async (input) => record(input),
+        // Test/debug hook: run the correction step without opening the mic.
+        correct: async (input) => ({
+          text: await correctText(
+            typeof input?.text === "string" ? input.text : "",
+            typeof input?.sessionID === "string" ? input.sessionID : undefined,
+          ),
+        }),
         stop: async () => {
           if (active?.stdin?.writable) {
             try {
@@ -867,6 +975,33 @@ function numberOption(value, fallback, min, max) {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
   return Math.min(max, Math.max(min, number));
+}
+
+/** Resolve a correction model given as {providerID,id} or "provider/id". */
+function normalizeCorrectionModel(value) {
+  if (value && typeof value === "object") {
+    const { providerID, id } = value;
+    return typeof providerID === "string" && typeof id === "string"
+      ? { providerID, id }
+      : undefined;
+  }
+  if (typeof value === "string") {
+    const [providerID, id] = value.split("/", 2);
+    if (providerID && id) return { providerID, id };
+  }
+  return undefined;
+}
+
+/** Never let a slow host model call hold the dictation RPC open indefinitely. */
+function withTimeout(promise, ms) {
+  let timer;
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(null), ms);
+    timer.unref?.();
+  });
+  return Promise.race([promise, deadline]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
 }
 
 function normalizeFixes(value) {

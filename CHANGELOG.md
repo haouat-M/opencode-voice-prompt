@@ -2,6 +2,32 @@
 
 All notable changes to this project are documented here.
 
+## 2.3.0 — 2026-11-21
+
+### Added
+
+- Contextual correction step before insertion: fixes recognition/spelling
+  mistakes using the sentence context without translating, changing the
+  speaker's dialect, or adding content. English-origin words spoken with an
+  Arabic accent are written in Latin script (`إنجلش` → `English`, `دوكر` →
+  `Docker`). The speaker's words and dialect (Lebanese, Palestinian, Jordanian,
+  Egyptian, …) are preserved. Correction uses only the host application's
+  model API — the focused session's transient generation when a session is
+  available, the experimental generate API otherwise. The plugin bundles no keys
+  and contacts no third-party endpoint.
+- New options `contextCorrection` (default `true`) and `correctionModel`, plus
+  the `OPENCODE_VOICE_CORRECTION_MODEL` override. Any failure, empty or
+  implausible reply falls back to the uncorrected transcription.
+- Dependency-free `correction.mjs` with unit tests (`node --test tests`) run in
+  CI alongside the Python suite, plus a `voice.correct` RPC hook for testing
+  correction without opening the microphone.
+
+### Fixed
+
+- The recording watchdog now allows 40 s after the engine timeout (was 25 s,
+  shorter than the 30 s recognizer timeout) and is stopped before the
+  correction call, so a slow model cannot leave the RPC stuck.
+
 ## 2.2.0 — 2026-11-14
 
 Full review pass: correctness, packaging, documentation and tests.
