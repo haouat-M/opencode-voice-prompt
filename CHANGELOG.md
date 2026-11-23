@@ -13,12 +13,12 @@ All notable changes to this project are documented here.
   `Docker`). The speaker's words and dialect (Lebanese, Palestinian, Jordanian,
   Egyptian, …) are preserved. Correction uses only the host application's
   model API — the focused session's transient generation when a session is
-  available, the experimental generate API otherwise. The plugin bundles no keys
-  and contacts no third-party endpoint.
+  available, the experimental generate API otherwise. The correction step bundles
+  no keys and contacts no third-party endpoint.
 - New options `contextCorrection` (default `true`) and `correctionModel`, plus
   the `OPENCODE_VOICE_CORRECTION_MODEL` override. Any failure, empty or
   implausible reply falls back to the uncorrected transcription.
-- Dependency-free `correction.mjs` with unit tests (`node --test tests`) run in
+- Dependency-free `correction.mjs` with unit tests (`node --test`) run in
   CI alongside the Python suite, plus a `voice.correct` RPC hook for testing
   correction without opening the microphone.
 
@@ -94,8 +94,9 @@ Full review pass: correctness, packaging, documentation and tests.
   registered only with `allowAgentRecording: true` and asks for permission on
   every call.
 - **Cleanup and status.** Unloading the plugin kills an active recorder, the GUI
-  polls `status` so a second window shows the recording, and clicking the
-  setup pill cancels setup.
+  polls `status` (so another window could see the recording at the time), and
+  clicking the setup pill cancels setup. In 2.3.0 this became per-session: the
+  pill only reflects its own session.
 - **Icons and tones.** The pill uses a supported icon, so the red/warning tone is
   visible while recording or preparing.
 - **Windows interpreter edge cases.** `python3` is always a candidate, and the
@@ -110,7 +111,7 @@ Full review pass: correctness, packaging, documentation and tests.
 
 ### Added
 
-- `tests/test_fixer.py` and `tests/test_engine_cli.py` (25 tests).
+- `tests/test_fixer.py`, `tests/test_engine_cli.py` and `tests/test_endpointing.py`
 - GitHub Actions CI on Ubuntu and Windows.
 - A privacy/permissions section and accurate troubleshooting in the README.
 

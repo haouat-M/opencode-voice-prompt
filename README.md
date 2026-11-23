@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![OpenCode Plugin](https://img.shields.io/badge/OpenCode-Plugin-green.svg)](https://opencode.ai)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20(tested)-lightgrey.svg)]()
-[![Python 3.8+](https://img.shields.io/badge/Python-3.8+-yellow.svg)](https://www.python.org/)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10+-yellow.svg)](https://www.python.org/)
 
 Hands-free voice dictation for **OpenCode Desktop**. The microphone control
 lives inside the OpenCode window, right above the prompt composer, and the
@@ -59,7 +59,7 @@ conversion (`Docker`, `GitHub`, `Python`, `React`, …).
 
 ### 1. Prerequisites
 
-The only requirement is **Python 3.8+** on your `PATH`:
+The only requirement is **Python 3.10+** on your `PATH`:
 
 ```bash
 python --version
@@ -270,9 +270,9 @@ stays untouched.
   audio) is passed to the host application's model API for cleanup — preferably
   the focused session's transient generation, which uses the same host model and
   allowance as chat and is not written to the conversation. No key is stored or
-  read by the plugin, and no third-party endpoint is contacted by the plugin
-  itself. On any failure the uncorrected text is used. Disable the whole step
-  with `contextCorrection: false`.
+  read by the plugin, and no third-party model endpoint is contacted by the
+  plugin for correction. On any failure the uncorrected text is used. Disable
+  the whole step with `contextCorrection: false`.
 - The first dictation may run `pip install` for `SpeechRecognition`,
   `sounddevice` and `numpy`. On a PEP 668 system it creates a private venv in
   `~/.cache/opencode-voice-prompt/venv`.
@@ -287,7 +287,7 @@ stays untouched.
 
 | Symptom | Fix |
 | --- | --- |
-| Pill shows `python was not found` | Install Python 3.8+, put it on `PATH`, or set `python` / `OPENCODE_VOICE_PYTHON`. |
+| Pill shows `python was not found` | Install Python 3.10+, put it on `PATH`, or set `python` / `OPENCODE_VOICE_PYTHON`. |
 | `"python" is the Microsoft Store alias` | Install Python from python.org, or disable the alias in Settings → Apps → App execution aliases. |
 | `PEP 668` / `externally-managed-environment` | Install `python3-venv`; the plugin will build its own environment. Or set `python` to a virtualenv interpreter. |
 | `No module named pip` (stock Ubuntu) | Run `sudo apt install python3-venv`; the plugin builds a private venv, since system pip is absent. |
@@ -309,8 +309,8 @@ python scripts/engine.py --action test
 ## 🧑‍💻 Development
 
 ```bash
-npm run check          # node --check on both JavaScript parts
-npm test               # Python unittest suite
+npm run check          # syntax check on index.js, gui-experimental.cjs and correction.mjs
+npm test               # Python unittest suite followed by node --test
 python scripts/engine.py --action fix --text "دوكر كومبوز"
 ```
 
@@ -321,12 +321,15 @@ CI runs both commands on Ubuntu and Windows for Node 20/22 and Python 3.10/3.12.
 ```text
 opencode-voice-prompt/
 ├── index.js                 # Server part: voice RPC + opt-in voice_input tool
+├── correction.mjs           # Contextual-correction prompt and reply parser
 ├── gui-experimental.cjs      # GUI part: composer pill + /voice command
 ├── scripts/
 │   └── engine.py             # Capture, silence detection, STT, term fixer
 ├── tests/
 │   ├── test_fixer.py         # Term-fixer regressions (ordinary Arabic stays intact)
-│   └── test_engine_cli.py    # JSON protocol / CLI smoke tests
+│   ├── test_engine_cli.py    # JSON protocol / CLI smoke tests
+│   ├── test_endpointing.py   # Silence and end-of-speech timing tests
+│   └── correction.test.mjs   # Contextual-correction unit tests
 ├── .github/workflows/ci.yml
 ├── legacy/                   # Optional v1 extras, never loaded automatically
 ├── CHANGELOG.md
@@ -335,7 +338,8 @@ opencode-voice-prompt/
 └── LICENSE
 ```
 
-Only `index.js`, `gui-experimental.cjs` and `scripts/` are loaded by OpenCode;
+OpenCode loads `index.js` (which imports `correction.mjs`) and
+`gui-experimental.cjs`; `scripts/engine.py` is launched as a child process, and
 `legacy/` is kept for people on the old floating-widget workflow.
 
 ---

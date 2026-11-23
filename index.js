@@ -551,7 +551,7 @@ export default Plugin.define({
           missing: [],
           error:
             lastError ||
-            "python was not found; install Python 3.8+ and put it on PATH (python or python3), or set OPENCODE_VOICE_PYTHON",
+            "python was not found; install Python 3.10+ and put it on PATH (python or python3), or set OPENCODE_VOICE_PYTHON",
         };
         return { ok: false, installed: false, missing: [], error: deps.error };
       }
@@ -648,7 +648,7 @@ export default Plugin.define({
 
       // Preferred: the focused session's transient generation. It uses the
       // host model and the session's allowance, and is not written to history.
-      // The plugin ships no keys and never talks to a third-party endpoint.
+      // This correction step ships no keys and talks to no third-party endpoint.
       try {
         if (sessionID && typeof ctx.session?.generate === "function") {
           const answer = await withTimeout(
