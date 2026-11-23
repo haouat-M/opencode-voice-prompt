@@ -27,6 +27,14 @@ All notable changes to this project are documented here.
 - The recording watchdog now allows 40 s after the engine timeout (was 25 s,
   shorter than the 30 s recognizer timeout) and is stopped before the
   correction call, so a slow model cannot leave the RPC stuck.
+- Session isolation: every session owns its recording state and its own
+  microphone pill. Recording or transcribing in one session no longer makes the
+  button in another session look busy, and dictated text stays in the session
+  where the recording started instead of following the focused tab. The
+  `status` RPC now reports per-session phases and `stop` accepts a `sessionID`.
+- CI runs `node --test` without a path so the JavaScript suite also works on
+  Node 22, where the explicit `tests` directory cannot be resolved; the minimum
+  supported Node version is now 20.
 
 ## 2.2.0 — 2026-11-14
 

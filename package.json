@@ -22,11 +22,11 @@
   ],
   "scripts": {
     "check": "node --check index.js && node --check gui-experimental.cjs && node --check correction.mjs",
-    "test": "python -m unittest discover -s tests -v && node --test tests",
-    "test:js": "node --test tests"
+    "test": "python -m unittest discover -s tests -v && node --test",
+    "test:js": "node --test"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "keywords": [
     "opencode",

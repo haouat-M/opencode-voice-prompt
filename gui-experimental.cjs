@@ -126,7 +126,7 @@ const Voice =
             },
           },
           stop: {
-            input: { type: "object", properties: {} },
+            input: { type: "object", properties: { sessionID: { type: "string" } } },
             output: {
               type: "object",
               properties: { ok: { type: "boolean" } },
@@ -137,7 +137,11 @@ const Voice =
             input: { type: "object", properties: {} },
             output: {
               type: "object",
-              properties: { recording: { type: "boolean" }, phase: { type: "string" } },
+              properties: {
+                recording: { type: "boolean" },
+                phase: { type: "string" },
+                sessions: { type: "object" },
+              },
               required: ["recording"],
             },
           },
@@ -163,111 +167,171 @@ function build() {
         }
       };
 
-      const [phase, setPhase] = signals.createSignal("idle");
-      const [note, setNote] = signals.createSignal("");
+      // Each session owns its own pill state. A recording in one session must
+      // never make the button in another session look busy.
+      const [statuses, setStatuses] = signals.createSignal({});
+      const localStates = new Map();
 
-      let busy = false;
-      let cancelRequested = false;
+      const idOf = (session) => session?.id ?? "default";
+
+      const statusByID = (id) => statuses()[id]?.phase ?? "idle";
+      const noteByID = (id) => statuses()[id]?.note ?? "";
+      const patchStatus = (id, patch) => {
+        setStatuses((prev) => ({
+          ...prev,
+          [id]: { phase: "idle", note: "", ...(prev[id] ?? {}), ...patch },
+        }));
+      };
+
+      const phaseOf = (session) => statusByID(idOf(session));
+      const noteOf = (session) => noteByID(idOf(session));
+      const setPhase = (session, value) => patchStatus(idOf(session), { phase: value });
+      const setNote = (session, value) => patchStatus(idOf(session), { note: value });
+
+      const localOf = (session) => {
+        const id = idOf(session);
+        let local = localStates.get(id);
+        if (!local) {
+          local = { busy: false, cancelRequested: false, timer: undefined };
+          localStates.set(id, local);
+        }
+        return local;
+      };
+
       /** True once the dependency check passed; avoids re-probing on every click. */
       let depsReady = false;
-      /** @type {ReturnType<typeof setTimeout> | undefined} */
-      let timer;
       /** @type {ReturnType<typeof setInterval> | undefined} */
       let statusTimer;
 
-      const currentSessionID = () => {
+      const currentSession = () => {
         try {
-          return ctx.sessions?.current?.()?.id;
+          return ctx.sessions?.current?.();
         } catch {
           return undefined;
         }
       };
 
-      const flash = (text) => {
-        setNote(text);
-        if (timer) clearTimeout(timer);
-        timer = setTimeout(() => setNote(""), 5000);
+      const currentSessionID = () => currentSession()?.id;
+
+      const activeTabKey = () => {
+        try {
+          return ctx.tabs?.list?.().find((tab) => tab.active)?.key;
+        } catch {
+          return undefined;
+        }
       };
 
-      const dictate = async () => {
+      const flash = (session, text) => {
+        setNote(session, text);
+        const local = localOf(session);
+        if (local.timer) clearTimeout(local.timer);
+        local.timer = setTimeout(() => setNote(session, ""), 5000);
+      };
+
+      const dictate = async (session) => {
         if (!Voice) {
-          flash("Voice: RPC unavailable");
+          flash(session, "Voice: RPC unavailable");
           return;
         }
 
+        const local = localOf(session);
+        const view = () => phaseOf(session);
+        const sid = typeof session?.id === "string" ? session.id : undefined;
+
         // A press during setup cancels it; a press while recording stops early.
-        if (busy) {
-          if (phase() === "setup") {
-            cancelRequested = true;
-            flash(t("voice.cancelled"));
+        if (local.busy) {
+          if (view() === "setup") {
+            local.cancelRequested = true;
+            flash(session, t("voice.cancelled"));
             return;
           }
-          if (phase() === "processing") {
-            flash(t("voice.processing"));
+          if (view() === "processing") {
+            flash(session, t("voice.processing"));
             return;
           }
           try {
-            await ctx.client.rpc(Voice).stop({});
+            await ctx.client.rpc(Voice).stop({ sessionID: sid });
           } catch {
             /* the recording may already have ended on silence */
           }
+          local.busy = false;
+          setPhase(session, "idle");
           return;
         }
 
-        // Another window may own the recording; this press stops that one.
-        if (phase() === "recording") {
+        if (view() === "recording") {
           try {
-            await ctx.client.rpc(Voice).stop({});
-            setPhase("idle");
+            await ctx.client.rpc(Voice).stop({ sessionID: sid });
+            setPhase(session, "idle");
           } catch {
             /* the recording may already have ended */
           }
           return;
         }
 
-        // The microphone is already closed and the text is on its way; a new
-        // recording would only fail with "already in progress".
-        if (phase() === "processing") {
-          flash(t("voice.processing"));
+        if (view() === "processing") {
+          flash(session, t("voice.processing"));
           return;
         }
 
-        // Capture the composer before recording. Recording takes seconds, and
-        // `ctx.screen.current()` afterwards could point at another session.
         const composer = ctx.screen.current()?.composer;
         if (!composer) {
-          flash(t("voice.noComposer"));
+          flash(session, t("voice.noComposer"));
           return;
         }
-        const sessionID = currentSessionID();
+        const startSession = session ?? currentSession();
+        const sessionID = startSession?.id;
 
-        busy = true;
-        cancelRequested = false;
-        setNote("");
-        setPhase("setup");
+        local.busy = true;
+        local.cancelRequested = false;
+        setNote(session, "");
+        setPhase(session, "setup");
 
         try {
-          // First run on this machine may install the Python audio libraries.
-          // A failed check is retried on the next click; a check that already
-          // passed is served from the cache, so recording starts immediately.
           const ready = await ctx.client.rpc(Voice).ensure({ force: !depsReady });
           depsReady = Boolean(ready?.ok);
-          if (cancelRequested) {
-            flash(t("voice.cancelled"));
+          if (local.cancelRequested) {
+            flash(session, t("voice.cancelled"));
             return;
           }
           if (!ready?.ok) {
-            flash(ready?.error || t("voice.setup"));
+            flash(session, ready?.error || t("voice.setup"));
             return;
           }
 
-          setPhase("recording");
+          setPhase(session, "recording");
           const result = await ctx.client.rpc(Voice).transcribe({ sessionID });
           const text = typeof result?.text === "string" ? result.text.trim() : "";
 
           if (!text) {
             if (result?.code === "DEPENDENCY_ERROR") depsReady = false;
-            flash(result?.error || t("voice.noSpeech"));
+            flash(session, result?.error || t("voice.noSpeech"));
+            return;
+          }
+
+          // Writes apply to the routed session, so route back to the session
+          // whose button started this recording before inserting. Then restore
+          // the tab the user moved to, leaving the text in its own session.
+          const userTab = activeTabKey();
+          let targetTabKey;
+          try {
+            targetTabKey = ctx.tabs
+              ?.list?.()
+              .find((tab) => tab.session?.id === sessionID || tab.session?.key === startSession?.key)?.key;
+          } catch {
+            targetTabKey = undefined;
+          }
+          if (targetTabKey && ctx.tabs?.focus && userTab !== targetTabKey) {
+            ctx.tabs.focus(targetTabKey);
+            for (let i = 0; i < 20 && currentSessionID() !== sessionID; i += 1) {
+              await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+          }
+          // If the tab registry is unavailable, stay with the composer captured
+          // when the button was pressed instead of dropping the transcript.
+          const targetComposer = targetTabKey ? ctx.screen.current()?.composer : composer;
+          if (!targetComposer) {
+            flash(session, t("voice.noComposer"));
             return;
           }
 
@@ -275,40 +339,46 @@ function build() {
           // separator when the prompt already ends with a word.
           let current = "";
           try {
-            current = typeof composer.text === "function" ? composer.text() : "";
+            current = typeof targetComposer.text === "function" ? targetComposer.text() : "";
           } catch {
             current = "";
           }
           const needsSpace = current.length > 0 && !/\s$/.test(current) && !/^\s/.test(text);
 
-          composer.insert(needsSpace ? ` ${text}` : text);
-          composer.focus();
+          targetComposer.insert(needsSpace ? ` ${text}` : text);
+          targetComposer.focus();
 
-          if (sessionID && currentSessionID() && currentSessionID() !== sessionID) {
-            flash(t("voice.insertedElsewhere"));
+          if (userTab && userTab !== targetTabKey && ctx.tabs?.focus) {
+            ctx.tabs.focus(userTab);
+          }
+          if (userTab && userTab !== targetTabKey) {
+            flash(session, t("voice.insertedElsewhere"));
           }
         } catch (error) {
           depsReady = false;
-          flash(`Voice: ${error?.message ?? String(error)}`);
+          flash(session, `Voice: ${error?.message ?? String(error)}`);
         } finally {
-          busy = false;
-          cancelRequested = false;
-          setPhase("idle");
+          local.busy = false;
+          local.cancelRequested = false;
+          setPhase(session, "idle");
         }
       };
 
-      // The server is shared by every window: reflect a recording started
-      // elsewhere instead of showing a misleading "idle" pill.
+      // The server is shared by every window. Apply each session's state only
+      // to that session's pill, leaving every other button free.
       const syncStatus = async () => {
         if (!Voice) return;
-        // Never fight the local flow: setup and flash messages own the pill.
-        if (note() || phase() === "setup") return;
         try {
           const status = await ctx.client.rpc(Voice).status({});
-          if (note() || phase() === "setup") return;
-          if (status?.phase === "processing") setPhase("processing");
-          else if (status?.recording) setPhase("recording");
-          else if (!busy) setPhase("idle");
+          const sessions = status?.sessions ?? {};
+          for (const [id, phase] of Object.entries(sessions)) {
+            if (!localStates.get(id)?.busy) patchStatus(id, { phase });
+          }
+          for (const id of Object.keys(statuses())) {
+            if (!sessions[id] && !localStates.get(id)?.busy && statusByID(id) !== "idle") {
+              patchStatus(id, { phase: "idle" });
+            }
+          }
         } catch {
           /* the server may be reloading */
         }
@@ -323,9 +393,10 @@ function build() {
         ctx.add(gui.ComposerPill, {
           id: "mic",
           order: 10,
-          show: () => {
-            const pending = note();
-            const current = phase();
+          show: (input) => {
+            const session = input?.session ?? currentSession();
+            const pending = noteOf(session);
+            const current = phaseOf(session);
 
             if (pending) {
               return {
@@ -333,7 +404,7 @@ function build() {
                 label: `⚠ ${pending}`,
                 tone: "danger",
                 title: pending,
-                run: () => void dictate(),
+                run: () => void dictate(session),
               };
             }
             if (current === "setup") {
@@ -342,7 +413,7 @@ function build() {
                 label: t("voice.setup"),
                 tone: "warning",
                 title: t("voice.setupHint"),
-                run: () => void dictate(),
+                run: () => void dictate(session),
               };
             }
             if (current === "recording") {
@@ -351,7 +422,7 @@ function build() {
                 label: t("voice.recording"),
                 tone: "danger",
                 title: t("voice.recording"),
-                run: () => void dictate(),
+                run: () => void dictate(session),
               };
             }
             if (current === "processing") {
@@ -360,14 +431,14 @@ function build() {
                 label: t("voice.processing"),
                 tone: "warning",
                 title: t("voice.processing"),
-                run: () => void dictate(),
+                run: () => void dictate(session),
               };
             }
             return {
               icon: "outline-audio",
               label: t("voice.label"),
               title: t("voice.hint"),
-              run: () => void dictate(),
+              run: () => void dictate(session),
             };
           },
         });
@@ -392,13 +463,17 @@ function build() {
       }
 
       return () => {
-        if (timer) clearTimeout(timer);
         if (statusTimer) clearInterval(statusTimer);
-        if (busy && Voice) {
-          try {
-            void ctx.client.rpc(Voice).stop({});
-          } catch {
-            /* the plugin is unloading */
+        for (const local of localStates.values()) {
+          if (local.timer) clearTimeout(local.timer);
+        }
+        for (const [id, local] of localStates) {
+          if (local.busy && Voice) {
+            try {
+              void ctx.client.rpc(Voice).stop({ sessionID: id === "default" ? undefined : id });
+            } catch {
+              /* the plugin is unloading */
+            }
           }
         }
       };

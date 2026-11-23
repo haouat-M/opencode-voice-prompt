@@ -29,7 +29,7 @@ jobs:
           node --check correction.mjs
 
       - name: Run the JavaScript correction tests
-        run: node --test tests
+        run: node --test
 
       - uses: actions/setup-python@v5
         with:

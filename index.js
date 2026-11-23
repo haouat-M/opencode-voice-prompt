@@ -110,7 +110,7 @@ export const Voice = Rpc.define({
       },
     },
     stop: {
-      input: { type: "object", properties: {} },
+      input: { type: "object", properties: { sessionID: { type: "string" } } },
       output: {
         type: "object",
         properties: { ok: { type: "boolean" } },
@@ -124,6 +124,7 @@ export const Voice = Rpc.define({
         properties: {
           recording: { type: "boolean" },
           phase: { type: "string" },
+          sessions: { type: "object" },
         },
         required: ["recording"],
       },
@@ -306,11 +307,15 @@ export default Plugin.define({
 
     const customFixes = normalizeFixes(options.fixes);
 
-    /** @type {import("node:child_process").ChildProcess | null} */
-    let active = null;
+    /**
+     * Every session owns its recorder. States stay apart even when the shared
+     * microphone lets two sessions run at once.
+     * @type {Map<string, { child: import("node:child_process").ChildProcess, phase: string }>}
+     */
+    const activeBySession = new Map();
 
-    /** "recording" or "processing" while a dictation runs; empty when idle. */
-    let activePhase = "";
+    const sessionKey = (input) =>
+      typeof input?.sessionID === "string" && input.sessionID ? input.sessionID : "default";
 
     /** Interpreter that passed the doctor probe, reused for recording. */
     let resolvedExe = null;
@@ -699,7 +704,8 @@ export default Plugin.define({
     const record = async (input) => {
       const request = input ?? {};
 
-      if (active) return { text: "", error: "a recording is already in progress" };
+      const key = sessionKey(request);
+      if (activeBySession.has(key)) return { text: "", error: "a recording is already in progress" };
       if (!existsSync(ENGINE)) return { text: "", error: `voice engine not found at ${ENGINE}` };
 
       const ready = await ensureOnce();
@@ -707,7 +713,7 @@ export default Plugin.define({
         return { text: "", error: ready.error || "the voice dependencies are not installed" };
       }
       // A second call may have started while the dependency check was running.
-      if (active) return { text: "", error: "a recording is already in progress" };
+      if (activeBySession.has(key)) return { text: "", error: "a recording is already in progress" };
 
       return new Promise((resolve) => {
         const language =
@@ -741,14 +747,13 @@ export default Plugin.define({
         /** @type {NodeJS.Timeout | undefined} */
         let killer;
 
+        let entry;
+
         const finish = (result) => {
           if (settled) return;
           settled = true;
           if (killer) clearTimeout(killer);
-          if (active === child) {
-            active = null;
-            activePhase = "";
-          }
+          if (entry && activeBySession.get(key) === entry) activeBySession.delete(key);
           resolve(result);
         };
 
@@ -761,12 +766,12 @@ export default Plugin.define({
             stdio: ["pipe", "pipe", "pipe"],
             env: { ...process.env, PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1" },
           });
-          active = child;
-          activePhase = "recording";
+          entry = { child, phase: "recording" };
+          activeBySession.set(key, entry);
 
           // A hung network request must not poison the plugin forever: without
-          // this, `active` would stay set and every later dictation would be
-          // rejected with "a recording is already in progress".
+          // this, the session would stay busy and later dictations there would
+          // be rejected with "a recording is already in progress".
           killer = setTimeout(() => {
             try {
               child?.kill();
@@ -790,7 +795,7 @@ export default Plugin.define({
             // the pill can say "transcribing" while the network call runs.
             // Matching on the accumulated text avoids false negatives when a
             // marker is split across two chunks.
-            if (stdout.includes("__STATUS_PROCESSING__")) activePhase = "processing";
+            if (stdout.includes("__STATUS_PROCESSING__") && entry) entry.phase = "processing";
           });
           child.stderr?.on("data", (chunk) => {
             stderr += chunk.toString("utf8");
@@ -802,7 +807,7 @@ export default Plugin.define({
             // Try the next interpreter when this one does not exist.
             if (error?.code === "ENOENT" && attempt + 1 < execs.length) {
               attempt += 1;
-              active = null;
+              activeBySession.delete(key);
               launch();
               return;
             }
@@ -865,7 +870,7 @@ export default Plugin.define({
             if (attempt + 1 < execs.length && isStoreStub({ stdout, stderr })) {
               if (sameExecutable(exe, resolvedExe)) resolvedExe = null;
               attempt += 1;
-              active = null;
+              activeBySession.delete(key);
               launch();
               return;
             }
@@ -895,18 +900,28 @@ export default Plugin.define({
             typeof input?.sessionID === "string" ? input.sessionID : undefined,
           ),
         }),
-        stop: async () => {
-          if (active?.stdin?.writable) {
-            try {
-              active.stdin.write("stop\n");
-            } catch {
-              /* the process may have exited between the check and the write */
+        stop: async (input) => {
+          const key = typeof input?.sessionID === "string" ? input.sessionID : undefined;
+          const entries = key ? [activeBySession.get(key)].filter(Boolean) : [...activeBySession.values()];
+          for (const item of entries) {
+            if (item.child.stdin?.writable) {
+              try {
+                item.child.stdin.write("stop\n");
+              } catch {
+                /* the process may have exited between the check and the write */
+              }
             }
           }
           return { ok: true };
         },
         status: async () => {
-          return { recording: active !== null, phase: active ? activePhase || "recording" : "idle" };
+          const sessions = {};
+          for (const [id, item] of activeBySession) sessions[id] = item.phase || "recording";
+          return {
+            recording: activeBySession.size > 0,
+            phase: [...activeBySession.values()][0]?.phase || "idle",
+            sessions,
+          };
         },
       });
     } catch (error) {
@@ -961,12 +976,14 @@ export default Plugin.define({
     // Kill an in-flight recorder when the plugin unloads or reloads. Without
     // this the microphone could stay open with no UI left to stop it.
     return () => {
-      try {
-        if (active) active.kill();
-      } catch {
-        /* already gone */
+      for (const item of activeBySession.values()) {
+        try {
+          item.child.kill();
+        } catch {
+          /* already gone */
+        }
       }
-      active = null;
+      activeBySession.clear();
     };
   },
 });

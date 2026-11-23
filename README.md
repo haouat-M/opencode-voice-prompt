@@ -35,7 +35,9 @@ conversion (`Docker`, `GitHub`, `Python`, `React`, …).
   speech ends.
 - ✍️ **Writes into the prompt box** — uses `composer.insert(text)` and keeps the
   cursor in the prompt. The target session is captured *before* recording, so
-  switching sessions mid-dictation cannot lose or misplace the text.
+  switching sessions mid-dictation cannot lose or misplace the text. Every
+  session owns its recorder state and its own pill, so recording in one session
+  leaves the button in another session free and idle.
 - 🌐 **Technical terminology correction** — spoken Arabic/English variants
   become exact English terms. Ambiguous everyday words such as «جيت» and «بوش»
   are only rewritten next to a real technical term, so normal dictation is not
@@ -139,9 +141,9 @@ Restart or reload the app (`opencode reload`) after changing the config.
 Stopping fast: click the pill (or press `Ctrl+Alt+A` again) right after your
 last word — that ends the recording immediately and skips the silence wait.
 
-The pill reflects the real server state, so a second OpenCode window shows
-«Recording…» too; clicking it there stops the recording. If setup is running,
-clicking the pill cancels it.
+The pill reflects the state of its own session only. Recording in one session
+does not make the pill busy in another session, so that button stays free for a
+separate recording there. If setup is running, clicking the pill cancels it.
 
 ### Plugin options
 
@@ -196,8 +198,8 @@ The server part exposes the `voice` RPC:
 | `ensure`     | `{ force? }`                         | `{ ok, installed, missing?, python?, error? }`  |
 | `transcribe` | `{ language?, silence?, timeout?, sessionID? }`  | `{ text, raw?, duration?, language?, code?, error? }` |
 | `correct`    | `{ text, sessionID? }`                 | `{ text }` — run the contextual correction without opening the mic (test hook) |
-| `stop`       | `{}`                                 | `{ ok }`                                        |
-| `status`     | `{}`                                 | `{ recording, phase }`                          |
+| `stop`       | `{ sessionID? }`                       | `{ ok }` - omit `sessionID` to stop every session |
+| `status`     | `{}`                                 | `{ recording, phase, sessions }` - `sessions` maps each session ID to its own phase |
 
 `ensure` verifies Python and the audio packages, installing anything missing on
 the first call. `force: true` bypasses both the positive and the negative cache,
